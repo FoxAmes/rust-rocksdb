@@ -64,6 +64,12 @@ pub trait WriteBatchIterator {
     fn delete(&mut self, key: Box<[u8]>);
 }
 
+/// Receives the log data of a write batch.
+pub trait WriteBatchLogIterator {
+    /// Called with the log data associated with the batch.
+    fn log_data(&mut self, data: Box<[u8]>);
+}
+
 unsafe extern "C" fn writebatch_put_callback(
     state: *mut c_void,
     k: *const c_char,
@@ -90,6 +96,15 @@ unsafe extern "C" fn writebatch_delete_callback(state: *mut c_void, k: *const c_
     let leaked_cb = Box::leak(boxed_cb);
     let key = slice::from_raw_parts(k as *const u8, klen);
     leaked_cb.delete(key.to_vec().into_boxed_slice());
+}
+
+unsafe extern "C" fn writebatch_log_callback(state: *mut c_void, d: *const c_char, dlen: usize) {
+    // coerce the raw pointer back into a box, but "leak" it so we prevent
+    // freeing the resource before we are done with it
+    let boxed_cb = Box::from_raw(state as *mut &mut dyn WriteBatchLogIterator);
+    let leaked_cb = Box::leak(boxed_cb);
+    let data = slice::from_raw_parts(d as *const u8, dlen);
+    leaked_cb.log_data(data.to_vec().into_boxed_slice());
 }
 
 impl<const TRANSACTION: bool> WriteBatchWithTransaction<TRANSACTION> {
@@ -161,6 +176,20 @@ impl<const TRANSACTION: bool> WriteBatchWithTransaction<TRANSACTION> {
                 state as *mut c_void,
                 Some(writebatch_put_callback),
                 Some(writebatch_delete_callback),
+            );
+            // we must manually set the raw box free since there is no
+            // associated "destroy" callback for this object
+            drop(Box::from_raw(state));
+        }
+    }
+
+    pub fn iterate_log(&self, callbacks: &mut dyn WriteBatchLogIterator) {
+        let state = Box::into_raw(Box::new(callbacks));
+        unsafe {
+            ffi::rocksdb_writebatch_iterate_log(
+                self.inner,
+                state as *mut c_void,
+                Some(writebatch_log_callback),
             );
             // we must manually set the raw box free since there is no
             // associated "destroy" callback for this object
